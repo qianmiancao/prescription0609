@@ -13,6 +13,9 @@ import warnings
 import tempfile
 import pandas as pd
 from datetime import datetime
+from io import BytesIO
+from docx import Document  # 需要安装 python-docx
+from docx.shared import Pt, Inches
 
 # --- 2. 基础环境配置 ---
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -30,7 +33,34 @@ DB_PATH = "./drug_db"
 if not os.path.exists(DB_PATH):
     os.makedirs(DB_PATH, exist_ok=True)
 
-# --- 3. 逻辑类定义 ---
+# --- 3. 核心工具函数 ---
+
+def generate_docx(text):
+    """将 Markdown 文本转换为 Word 文档"""
+    doc = Document()
+    doc.add_heading('处方点评报告', 0)
+    
+    # 设置全文字体
+    style = doc.styles['Normal']
+    style.font.name = '微软雅黑'
+    style.font.size = Pt(11)
+
+    # 简单处理 Markdown 行
+    for line in text.split('\n'):
+        line = line.strip()
+        if line.startswith('###'):
+            doc.add_heading(line.replace('#', '').strip(), level=2)
+        elif line.startswith('##'):
+            doc.add_heading(line.replace('#', '').strip(), level=1)
+        elif line.startswith('- ') or line.startswith('* '):
+            doc.add_paragraph(line[2:], style='List Bullet')
+        elif line:
+            doc.add_paragraph(line)
+            
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio
 
 class KnowledgeManager:
     def __init__(self, model_name, db_path):
@@ -38,18 +68,14 @@ class KnowledgeManager:
             model_name=model_name,
             model_kwargs={'device': 'cpu'}
         )
-        self.vectorstore = Chroma(
-            persist_directory=db_path,
-            embedding_function=self.embeddings
-        )
+        self.vectorstore = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
 
     def upload_docs(self, file_path):
         loader = PyPDFLoader(file_path)
         docs = loader.load()
         splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-        splits = splitter.split_documents(docs)
-        self.vectorstore.add_documents(splits)
-        return len(splits)
+        self.vectorstore.add_documents(splitter.split_documents(docs))
+        return len(docs)
 
     def retrieve_context(self, drug_names):
         all_context = []
@@ -57,8 +83,8 @@ class KnowledgeManager:
             if not name: continue
             results = self.vectorstore.similarity_search(name, k=4)
             for res in results:
-                source = os.path.basename(res.metadata.get('source', '未知文档'))
-                all_context.append(f"【来源:{source}】\n{res.page_content}")
+                source = os.path.basename(res.metadata.get('source', '资料库'))
+                all_context.append(f"【{source}】: {res.page_content}")
         return "\n\n".join(list(set(all_context)))
 
 class PharmacyAgent:
@@ -71,13 +97,17 @@ class PharmacyAgent:
         )
 
     def audit(self, prescription_json, context):
-        system_prompt = """你是一位资深临床药师。请根据【参考资料】审核【处方数据】。
-        输出一份结构化的Markdown报告。必须包含：风险等级、各维度评估表、药师意见。
-        如果资料不足，请基于药学常识给出合理建议。"""
+        system_prompt = """你是一位资深临床药师。请为【处方数据】输出一份正式的点评报告。
+        要求：
+        1. 格式清晰，使用 Markdown 标题。
+        2. 如果患者是儿童，必须核算 mg/kg 剂量。
+        3. 如果是成人，重点评估适应症、药物相互作用和医保。
+        4. 结论必须明确：[合理/不合理/用药不适宜]。
+        5. 对不合理项给出明确的临床建议。"""
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
-            ("user", "【参考资料】:\n{context}\n\n【处方数据】:\n{prescription}")
+            ("user", "【参考资料库】:\n{context}\n\n【处方数据】:\n{prescription}")
         ])
         chain = prompt | self.llm
         return chain.invoke({
@@ -85,116 +115,113 @@ class PharmacyAgent:
             "prescription": json.dumps(prescription_json, ensure_ascii=False)
         }).content
 
-# --- 4. 缓存与状态初始化 ---
-
-@st.cache_resource
-def get_km():
-    return KnowledgeManager("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", DB_PATH)
-
-# 初始化 SessionState 用于存储可编辑的报告
-if "edit_report" not in st.session_state:
-    st.session_state.edit_report = ""
-
-# --- 5. Streamlit UI ---
+# --- 4. Streamlit UI ---
 
 def main():
-    st.set_page_config(page_title="AI 药师审方 (专家编辑版)", layout="wide")
+    st.set_page_config(page_title="AI 药师专家系统", layout="wide", page_icon="⚖️")
+    
+    @st.cache_resource
+    def get_km():
+        return KnowledgeManager("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", DB_PATH)
+    
     km = get_km()
 
     # --- 侧边栏 ---
     with st.sidebar:
-        st.title("🔐 系统设置")
+        st.header("⚙️ 系统配置")
         api_key = st.text_input("DeepSeek API Key:", type="password")
         st.divider()
-        st.header("📚 知识库上传")
-        files = st.file_uploader("上传说明书 (PDF)", accept_multiple_files=True)
-        if files and st.button("同步知识库"):
+        st.header("📚 说明书知识库")
+        files = st.file_uploader("上传 PDF 说明书", accept_multiple_files=True)
+        if files and st.button("同步知识"):
             for f in files:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(f.getvalue())
                     km.upload_docs(tmp.name)
-            st.success("同步成功！")
+            st.success("知识库同步完成")
 
     # --- 主界面 ---
-    st.title("💊 药剂科 AI 处方审核与点评系统")
-    
-    if not api_key:
-        st.info("💡 请先在侧边栏配置 API Key")
-        st.stop()
+    st.title("🏥 临床药师审方及点评专家平台")
 
-    agent = PharmacyAgent(api_key, "https://api.deepseek.com")
+    if "report_content" not in st.session_state:
+        st.session_state.report_content = ""
 
-    col_input, col_report = st.columns([1, 1.2])
+    col_in, col_out = st.columns([1, 1.3])
 
-    # --- 左侧：处方录入 (可自由输入) ---
-    with col_input:
-        st.subheader("📋 处方信息录入")
-        with st.expander("👤 患者基本信息", expanded=True):
+    # --- 左侧：录入 ---
+    with col_in:
+        st.subheader("📋 处方录入")
+        with st.container(border=True):
+            # 成人/儿童逻辑切换
+            p_type = st.radio("患者类型", ["儿童 (需计算体重剂量)", "成人"], horizontal=True)
+            
             c1, c2 = st.columns(2)
-            age = c1.number_input("年龄", 6)
-            weight = c2.number_input("体重 (kg)", 22.0)
-            diag = st.text_input("临床诊断", "社区获得性肺炎")
+            age = c1.number_input("年龄", value=30 if p_type == "成人" else 6, min_value=0)
+            
+            weight = None
+            if p_type == "儿童 (需计算体重剂量)":
+                weight = c2.number_input("体重 (kg)", value=20.0, step=0.1)
+            else:
+                c2.info("💡 成人无需输入体重")
 
-        st.markdown("**💊 药品明细 (可增减行/修改内容)**")
-        # 默认示例数据
-        default_data = [
-            {"药品名称": "阿奇霉素干混悬剂", "剂量": "0.25g", "频次": "QD", "用法": "口服"},
-            {"药品名称": "布地奈德混悬液", "剂量": "1mg", "频次": "BID", "用法": "雾化吸入"}
-        ]
-        # 使用 data_editor 实现药品可输入/可增减
-        med_df = st.data_editor(
-            pd.DataFrame(default_data), 
-            num_rows="dynamic", 
-            use_container_width=True,
-            key="med_editor"
-        )
+            diag = st.text_input("临床诊断", "急性支气管炎")
 
-        if st.button("🚀 开始 AI 辅助审核", type="primary", use_container_width=True):
-            with st.spinner("AI 药师分析中..."):
-                drug_names = med_df["药品名称"].tolist()
-                context = km.retrieve_context(drug_names)
-                prescription = {
-                    "patient": {"age": age, "weight": weight, "diagnosis": diag},
-                    "medications": med_df.to_dict('records')
-                }
-                # 获取 AI 原始报告并存入 session_state
-                st.session_state.edit_report = agent.audit(prescription, context)
+            st.markdown("**💊 药品清单**")
+            default_data = [{"药品名称": "阿奇霉素干混悬剂", "单次剂量": "0.25g", "频次": "QD", "用法": "口服"}]
+            med_df = st.data_editor(pd.DataFrame(default_data), num_rows="dynamic", use_container_width=True)
 
-    # --- 右侧：点评报告 (可二次修改) ---
-    with col_report:
-        st.subheader("📝 处方点评报告 (药师可修改)")
-        
-        if st.session_state.edit_report:
-            # 使用 text_area 提供修改权限
-            edited_text = st.text_area(
-                "您可以直接在下方修改 AI 生成的内容：",
-                value=st.session_state.edit_report,
-                height=600,
-                key="report_area"
+            if st.button("🔍 执行 AI 深度点评", type="primary", use_container_width=True):
+                if not api_key:
+                    st.error("请先输入 API Key")
+                else:
+                    agent = PharmacyAgent(api_key, "https://api.deepseek.com")
+                    with st.spinner("临床推理中..."):
+                        context = km.retrieve_context(med_df["药品名称"].tolist())
+                        prescription = {
+                            "patient": {"age": age, "weight": weight, "diagnosis": diag, "type": p_type},
+                            "medications": med_df.to_dict('records')
+                        }
+                        st.session_state.report_content = agent.audit(prescription, context)
+
+    # --- 右侧：点评报告 ---
+    with col_out:
+        st.subheader("📝 处方点评报告")
+        if st.session_state.report_content:
+            # 1. 可编辑区域
+            edited_report = st.text_area(
+                "手动修正区（修改后将实时同步至导出文件）：",
+                value=st.session_state.report_content,
+                height=550
             )
+            st.session_state.report_content = edited_report
             
-            # 同步修改到 session_state
-            st.session_state.edit_report = edited_text
-            
+            # 2. 导出与操作区
             st.divider()
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if st.button("💾 保存当前修改"):
-                    st.success("修改已保存")
-            with c2:
+            ctrl_c1, ctrl_c2, ctrl_c3 = st.columns(3)
+            
+            with ctrl_c1:
+                # 预览切换
+                if st.toggle("预览渲染后的格式", value=True):
+                    with st.expander("报告预览", expanded=True):
+                        st.markdown(st.session_state.report_content)
+            
+            with ctrl_c2:
+                # Word 导出
+                docx_file = generate_docx(st.session_state.report_content)
                 st.download_button(
-                    "📥 导出最终报告 (TXT)",
-                    st.session_state.edit_report,
-                    file_name=f"处方点评_{datetime.now().strftime('%Y%m%d')}.txt"
+                    label="📥 导出为 Word 文档",
+                    data=docx_file,
+                    file_name=f"点评报告_{datetime.now().strftime('%m%d_%H%M')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
-            with c3:
-                # 预览模式切换
-                if st.checkbox("👁️ 预览 Markdown 格式"):
-                    st.markdown("---")
-                    st.markdown(st.session_state.edit_report)
+            
+            with ctrl_c3:
+                if st.button("🗑️ 清空报告"):
+                    st.session_state.report_content = ""
+                    st.rerun()
         else:
-            st.info("等待处方提交后生成报告...")
-            st.image("https://via.placeholder.com/600x400.png?text=Audit+Report+Area", use_column_width=True)
+            st.info("请在左侧录入处方并点击“执行 AI 深度点评”")
+            st.empty()
 
 if __name__ == "__main__":
     main()
