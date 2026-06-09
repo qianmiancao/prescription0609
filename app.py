@@ -1,4 +1,4 @@
-# --- 1. 核心兼容性补丁 (必须处于最顶部) ---
+# --- 1. 核心兼容性补丁 (解决 Streamlit Cloud 的 SQLite 版本问题) ---
 import sys
 try:
     import pysqlite3
@@ -29,8 +29,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 
-# 变更路径以强制刷新数据库索引，解决持久化引起的 InternalError
-DB_PATH = "./drug_db_final" 
+# 数据库存储路径
+DB_PATH = "./drug_db_v4" 
 
 # --- 3. 逻辑类定义 ---
 
@@ -44,7 +44,6 @@ class KnowledgeManager:
         self.vectorstore = self.init_db()
 
     def init_db(self):
-        """初始化数据库"""
         try:
             return Chroma(persist_directory=self.db_path, embedding_function=self.embeddings)
         except Exception:
@@ -53,7 +52,6 @@ class KnowledgeManager:
             return Chroma(persist_directory=self.db_path, embedding_function=self.embeddings)
 
     def upload_docs(self, file_path, original_name):
-        """上传并索引 PDF"""
         loader = PyPDFLoader(file_path)
         docs = loader.load()
         for doc in docs:
@@ -64,16 +62,13 @@ class KnowledgeManager:
         return len(splits)
 
     def retrieve_context(self, drug_names):
-        """检索知识库并返回结果及来源"""
         results = []
         sources = set()
         for name in drug_names:
             if not name: continue
-            # 执行相似度搜索
             docs = self.vectorstore.similarity_search(name, k=3)
             for d in docs:
-                src = os.path.basename(d.metadata.get('source', '参考资料'))
-                # 简单校验：确保药名在内容中出现，减少误报
+                src = os.path.basename(d.metadata.get('source', '资料'))
                 if name[:2] in d.page_content or name[:2] in src:
                     results.append(f"【内容源自《{src}》】: {d.page_content}")
                     sources.add(src)
@@ -90,14 +85,15 @@ class PharmacyAgent:
 
     def audit(self, p_data, context):
         system_prompt = """你是一位资深临床药师。请根据参考资料审核处方。
-        格式要求：
-        1. 禁止使用星号*。
-        2. 必须列出处方号。
-        3. 结构包含：一、基本信息；二、药品清单；三、药学点评；四、结论。
-        报告末尾注明参考文件名。"""
+        审核逻辑要求：
+        1. 若患者为儿童，必须严格依据体重计算 mg/kg 剂量。
+        2. 若患者为成人，体重未提供时，依据成人标准说明书剂量审核。
+        3. 报告禁止使用星号*。
+        4. 结构：一、基本信息；二、产品明细；三、适宜性点评；四、结论。
+        末尾列出参考文件名。"""
         
         prompt = ChatPromptTemplate.from_template(
-            "系统指令: {sys}\n参考资料: {ctx}\n待审处方: {rx}"
+            "指令: {sys}\n资料: {ctx}\n处方: {rx}"
         )
         chain = prompt | self.llm
         res = chain.invoke({
@@ -111,10 +107,10 @@ class PharmacyAgent:
 
 def generate_docx(text, p_no):
     doc = Document()
-    doc.add_heading('处方点评报告', 0)
-    doc.add_paragraph(f"处方号：{p_no}")
-    doc.add_paragraph(f"日期：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    doc.add_paragraph("-" * 20)
+    doc.add_heading('临床处方点评报告', 0)
+    doc.add_paragraph(f"处方编号：{p_no}")
+    doc.add_paragraph(f"点评时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    doc.add_paragraph("-" * 30)
     for line in text.split('\n'):
         if line.strip(): doc.add_paragraph(line.strip())
     bio = BytesIO()
@@ -122,17 +118,17 @@ def generate_docx(text, p_no):
     bio.seek(0)
     return bio
 
-# --- 5. Streamlit UI ---
+# --- 5. Streamlit UI 界面 ---
 
 def main():
-    st.set_page_config(page_title="AI 药师点评系统", layout="wide")
+    st.set_page_config(page_title="AI 药师专家系统", layout="wide", page_icon="💊")
     
-    # 强制刷新缓存的小技巧：如果代码变动，修改此处的版本号
-    @st.cache_resource(show_spinner="正在加载知识引擎...")
-    def get_km(v="1.0"):
+    # 刷新缓存版本
+    @st.cache_resource(show_spinner="引擎启动中...")
+    def get_km(v="3.0"):
         return KnowledgeManager("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", DB_PATH)
     
-    km = get_km(v="2.0") # 升级版本号强制刷新实例
+    km = get_km()
 
     if "rpt" not in st.session_state: st.session_state.rpt = ""
     if "srcs" not in st.session_state: st.session_state.srcs = []
@@ -140,15 +136,16 @@ def main():
     with st.sidebar:
         st.header("⚙️ 知识库管理")
         api_key = st.text_input("DeepSeek API Key:", type="password")
-        files = st.file_uploader("上传药品说明书", accept_multiple_files=True)
-        if files and st.button("✨ 开始同步"):
-            for f in files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(f.getvalue())
-                    km.upload_docs(tmp.name, f.name)
-            st.success("同步成功")
+        files = st.file_uploader("上传药品说明书 (PDF)", accept_multiple_files=True)
+        if files and st.button("✨ 同步到本地库"):
+            with st.spinner("解析并建立索引..."):
+                for f in files:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(f.getvalue())
+                        km.upload_docs(tmp.name, f.name)
+            st.success("同步完成")
         
-        if st.button("🗑️ 重置数据库"):
+        if st.button("🗑️ 清空数据库"):
             if os.path.exists(DB_PATH): shutil.rmtree(DB_PATH)
             st.rerun()
 
@@ -160,50 +157,73 @@ def main():
         st.subheader("📋 处方录入")
         with st.container(border=True):
             p_no = st.text_input("处方号", value="RX"+datetime.now().strftime("%H%M%S"))
-            diag = st.text_input("诊断", "急性支气管炎")
-            age = st.number_input("年龄", 6)
-            weight = st.number_input("体重 (kg)", 22.0)
+            diag = st.text_input("临床诊断", "社区获得性肺炎")
             
+            # --- 核心改进：成人/儿童切换逻辑 ---
+            p_type = st.radio("患者类型", ["成人", "儿童"], horizontal=True)
+            
+            c1, c2 = st.columns(2)
+            age = c1.number_input("年龄", value=35 if p_type == "成人" else 6)
+            
+            weight = None
+            if p_type == "儿童":
+                weight = c2.number_input("体重 (kg)", value=22.0, help="儿童用药需输入体重以计算剂量")
+            else:
+                c2.info("💡 成人模式下无需输入体重")
+
             st.markdown("**具体产品明细**")
             med_df = st.data_editor(
-                pd.DataFrame([{"产品名称": "阿莫西林", "用量": "0.25g", "频次": "QD"}]),
+                pd.DataFrame([{"产品名称": "阿莫西林胶囊", "剂量": "0.5g", "频次": "TID", "用法": "口服"}]),
                 num_rows="dynamic", use_container_width=True
             )
 
-        if st.button("🔍 执行点评", type="primary", use_container_width=True):
-            if not api_key: st.error("请输入 API Key")
+        if st.button("🔍 执行深度点评", type="primary", use_container_width=True):
+            if not api_key:
+                st.error("请输入 API Key")
             else:
                 agent = PharmacyAgent(api_key)
-                with st.spinner("正在匹配并分析..."):
+                with st.spinner("正在检索匹配并进行临床推理..."):
                     drugs = med_df["产品名称"].tolist()
-                    ctx, srcs = km.retrieve_context(drugs) # 此处名称必须与类定义一致
+                    ctx, srcs = km.retrieve_context(drugs)
                     st.session_state.srcs = srcs
                     
-                    data = {"no": p_no, "diag": diag, "age": age, "weight": weight, "meds": med_df.to_dict('records')}
-                    st.session_state.rpt = agent.audit(data, ctx)
+                    p_data = {
+                        "no": p_no, 
+                        "diag": diag, 
+                        "type": p_type,
+                        "age": age, 
+                        "weight": weight, 
+                        "meds": med_df.to_dict('records')
+                    }
+                    st.session_state.rpt = agent.audit(p_data, ctx)
                     st.rerun()
 
     with col2:
         st.subheader("📝 审核报告")
         if st.session_state.srcs:
-            st.info(f"参考文件: {', '.join(st.session_state.srcs)}")
+            st.success(f"参考溯源: {', '.join(st.session_state.srcs)}")
         
         if st.session_state.rpt:
-            # 实时同步编辑框
-            final_rpt = st.text_area("内容修改:", value=st.session_state.rpt, height=500)
+            # 药师修改区域
+            final_rpt = st.text_area("内容编辑:", value=st.session_state.rpt, height=550)
             st.session_state.rpt = final_rpt
             
             st.divider()
-            c1, c2 = st.columns(2)
-            with c1:
+            bt1, bt2 = st.columns(2)
+            with bt1:
                 st.download_button(
                     "📥 导出 Word 报告", 
                     data=generate_docx(st.session_state.rpt, p_no), 
-                    file_name=f"报告_{p_no}.docx"
+                    file_name=f"点评报告_{p_no}.docx",
+                    use_container_width=True,
+                    type="primary"
                 )
-            with c2:
-                if st.button("🗑️ 清空内容"):
-                    st.session_state.rpt = ""; st.rerun()
+            with bt2:
+                if st.button("🗑️ 清空报告", use_container_width=True):
+                    st.session_state.rpt = ""
+                    st.rerun()
+        else:
+            st.info("👈 请在左侧录入信息并点击执行点评。")
 
 if __name__ == "__main__":
     main()
