@@ -1,7 +1,9 @@
-# --- 1. 核心兼容性补丁 ---
+# --- 1. 核心兼容性补丁 (必须处于最顶部，且顺序不能错) ---
+import sys
+
 try:
+    # 强制使用 pysqlite3 代替标准库中的 sqlite3，这是解决 InternalError 的关键
     import pysqlite3
-    import sys
     sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 except ImportError:
     pass
@@ -13,6 +15,7 @@ import warnings
 import tempfile
 import pandas as pd
 import re 
+import shutil
 from datetime import datetime
 from io import BytesIO
 from docx import Document 
@@ -28,190 +31,156 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 
-DB_PATH = "./drug_db"
-if not os.path.exists(DB_PATH):
-    os.makedirs(DB_PATH, exist_ok=True)
+# 数据库存储路径 (Streamlit Cloud 建议使用相对路径)
+DB_PATH = "./drug_db_v2" 
 
-# --- 3. 工具函数 ---
+# --- 3. 逻辑类定义 ---
 
-def clean_markdown_symbols(text):
-    if not text: return ""
-    text = text.replace('*', '')
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+class KnowledgeManager:
+    def __init__(self, model_name, db_path):
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=model_name, 
+            model_kwargs={'device': 'cpu'}
+        )
+        self.db_path = db_path
+        self.init_db()
+
+    def init_db(self):
+        """初始化数据库，如果损坏则自动重建"""
+        try:
+            self.vectorstore = Chroma(
+                persist_directory=self.db_path, 
+                embedding_function=self.embeddings
+            )
+        except Exception as e:
+            # 如果出现 InternalError，通常是索引损坏，直接删除重建
+            if os.path.exists(self.db_path):
+                shutil.rmtree(self.db_path)
+            self.vectorstore = Chroma(
+                persist_directory=self.db_path, 
+                embedding_function=self.embeddings
+            )
+
+    def upload_docs(self, file_path, original_name):
+        try:
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            for doc in docs:
+                doc.metadata = {"source": original_name} 
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            splits = splitter.split_documents(docs)
+            self.vectorstore.add_documents(splits)
+            return len(splits)
+        except Exception as e:
+            st.error(f"解析文件 {original_name} 失败: {str(e)}")
+            return 0
+
+    def retrieve_context_with_sources(self, drug_names):
+        results_list = []
+        unique_sources = set()
+        for name in drug_names:
+            if not name or len(name.strip()) < 1: continue
+            # 使用相似度搜索
+            try:
+                docs = self.vectorstore.similarity_search(name, k=3)
+                for d in docs:
+                    src = os.path.basename(d.metadata.get('source', '未知'))
+                    if name[:2] in d.page_content or name[:2] in src: # 关键词二次校验
+                        results_list.append(f"【参考《{src}》】: {d.page_content}")
+                        unique_sources.add(src)
+            except:
+                continue
+        return "\n\n".join(results_list), list(unique_sources)
+
+# --- 4. 其他辅助函数 ---
+def clean_markdown(text):
+    return text.replace('*', '').strip()
 
 def generate_docx(text):
     doc = Document()
     doc.add_heading('处方点评报告', 0)
     for line in text.split('\n'):
-        if line.strip():
-            doc.add_paragraph(line.strip())
+        if line.strip(): doc.add_paragraph(line.strip())
     bio = BytesIO()
     doc.save(bio)
     bio.seek(0)
     return bio
 
-class KnowledgeManager:
-    def __init__(self, model_name, db_path):
-        self.embeddings = HuggingFaceEmbeddings(model_name=model_name, model_kwargs={'device': 'cpu'})
-        self.vectorstore = Chroma(persist_directory=db_path, embedding_function=self.embeddings)
-
-    def upload_docs(self, file_path, original_name):
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
-        for doc in docs:
-            # 关键修复：强制 metadata 只包含原始文件名
-            doc.metadata = {"source": original_name} 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-        self.vectorstore.add_documents(splitter.split_documents(docs))
-        return len(docs)
-
-    def retrieve_context_with_sources(self, drug_names):
-        """增强版检索：增加了药名关键词的硬校验，防止跨药匹配"""
-        results_list = []
-        unique_sources = set()
-        
-        for name in drug_names:
-            if not name or len(name.strip()) < 1: continue
-            
-            # 执行相似度检索
-            docs = self.vectorstore.similarity_search(name, k=4)
-            
-            for d in docs:
-                raw_src = d.metadata.get('source', '未知文档')
-                src_name = os.path.basename(raw_src)
-                
-                # 过滤条件1：排除包含 tmp 的旧垃圾数据
-                if "tmp" in src_name: continue
-                
-                # 过滤条件2：硬核核对。文件名或内容中必须包含当前药名的核心关键字
-                # 比如搜二甲双胍，结果文件名必须包含二甲双胍，否则认为是污染数据
-                keyword = name[:2] # 提取前两个字作为核心词
-                if keyword in src_name or keyword in d.page_content:
-                    results_list.append(f"【参考源自《{src_name}》】: {d.page_content}")
-                    unique_sources.add(src_name)
-                    
-        return "\n\n".join(results_list), list(unique_sources)
-
-class PharmacyAgent:
-    def __init__(self, api_key, base_url):
-        self.llm = ChatOpenAI(model="deepseek-chat", api_key=str(api_key).strip(), base_url=base_url, temperature=0.1)
-
-    def audit(self, prescription_json, context):
-        system_prompt = """你是一位资深临床药师。请根据【参考资料库】审核【处方数据】。
-        
-        重要：
-        1. 必须基于提供的资料进行分析。
-        2. 如果参考资料库的内容与处方药名不符，请在报告中明确指出“未找到该药说明书”。
-        3. 严禁使用 * 号，使用纯文本序号。"""
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("user", "【参考资料库】:\n{context}\n\n【处方数据】:\n{prescription}")
-        ])
-        chain = prompt | self.llm
-        return clean_markdown_symbols(chain.invoke({"context": context, "prescription": json.dumps(prescription_json, ensure_ascii=False)}).content)
-
-# --- 4. 初始化 ---
-@st.cache_resource
-def get_km():
-    return KnowledgeManager("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", DB_PATH)
-
-# --- 5. UI 界面 ---
+# --- 5. Streamlit UI ---
 def main():
-    st.set_page_config(page_title="AI 药师点评专家系统", layout="wide")
-    km = get_km()
-
+    st.set_page_config(page_title="AI 药师专家系统", layout="wide")
+    
+    # 初始化状态
     if "report_content" not in st.session_state: st.session_state.report_content = ""
     if "current_sources" not in st.session_state: st.session_state.current_sources = []
-    if "is_confirmed" not in st.session_state: st.session_state.is_confirmed = False
 
+    # 缓存管理
+    @st.cache_resource
+    def load_km():
+        return KnowledgeManager("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", DB_PATH)
+    
+    km = load_km()
+
+    # 侧边栏
     with st.sidebar:
         st.header("⚙️ 知识库管理")
         api_key = st.text_input("DeepSeek API Key:", type="password")
-        files = st.file_uploader("第一步：上传新说明书 (PDF)", accept_multiple_files=True)
+        files = st.file_uploader("上传 PDF 说明书", accept_multiple_files=True)
         if files and st.button("✨ 同步到本地库"):
-            for f in files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(f.getvalue())
-                    km.upload_docs(tmp.name, f.name) 
-            st.success("同步完成！")
+            with st.spinner("正在写入索引..."):
+                for f in files:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(f.getvalue())
+                        km.upload_docs(tmp.name, f.name)
+                st.success("同步完成")
         
-        st.divider()
-        st.warning("如果切换药品后参考文件不对，请点下方按钮：")
-        if st.button("🗑️ 清空所有旧索引(彻底重置)"):
-            import shutil
+        if st.button("🗑️ 清空并重置数据库"):
             if os.path.exists(DB_PATH):
                 shutil.rmtree(DB_PATH)
             st.rerun()
 
+    # 主界面
     st.title("🏥 临床药师点评专家平台")
-
+    
     col_in, col_out = st.columns([1, 1.3])
 
     with col_in:
         st.subheader("📋 处方录入")
         p_type = st.radio("患者类型", ["儿童", "成人"], horizontal=True)
         c1, c2 = st.columns(2)
-        age = c1.number_input("年龄", value=6)
-        weight = c2.number_input("体重 (kg)", value=20.0) if p_type == "儿童" else None
-        diag = st.text_input("临床诊断", value="急性支气管炎")
+        age = c1.number_input("年龄", 6)
+        weight = c2.number_input("体重 (kg)", 20.0) if p_type == "儿童" else None
+        diag = st.text_input("诊断", "急性支气管炎")
         
-        st.markdown("**药品明细表**")
         med_df = st.data_editor(
-            pd.DataFrame([{"药品名称": "二甲双胍", "单次剂量": "0.25g", "频次": "QD"}]), 
-            num_rows="dynamic", 
-            use_container_width=True
+            pd.DataFrame([{"药品名称": "阿莫西林", "单次剂量": "0.25g", "频次": "QD"}]), 
+            num_rows="dynamic", use_container_width=True
         )
 
         if st.button("🔍 执行深度点评", type="primary", use_container_width=True):
-            if api_key:
-                st.session_state.report_content = ""
-                st.session_state.current_sources = []
-                st.session_state.is_confirmed = False
+            if not api_key: st.error("请提供 API Key"); return
+            
+            from langchain_openai import ChatOpenAI
+            llm = ChatOpenAI(model="deepseek-chat", api_key=api_key, base_url="https://api.deepseek.com", temperature=0.1)
+            
+            with st.spinner("正在精准匹配说明书..."):
+                context, sources = km.retrieve_context_with_sources(med_df["药品名称"].tolist())
+                st.session_state.current_sources = sources
                 
-                agent = PharmacyAgent(api_key, "https://api.deepseek.com")
-                
-                with st.spinner("正在精准匹配说明书..."):
-                    drug_names = med_df["药品名称"].tolist()
-                    context_str, sources = km.retrieve_context_with_sources(drug_names)
-                    st.session_state.current_sources = sources
-                    
-                    prescription = {
-                        "patient": {"age": age, "weight": weight, "diagnosis": diag}, 
-                        "medications": med_df.to_dict('records')
-                    }
-                    st.session_state.report_content = agent.audit(prescription, context_str)
-                    st.rerun()
-            else:
-                st.error("请输入 API Key")
+                prompt = f"你是一位资深药师。根据资料：{context}\n审核处方：{med_df.to_dict('records')}\n诊断：{diag}\n患者：{age}岁, {weight}kg\n要求：不使用星号，纯文本格式。"
+                res = llm.invoke(prompt)
+                st.session_state.report_content = clean_markdown(res.content)
+                st.rerun()
 
     with col_out:
-        st.subheader("📝 点评报告与溯源")
-        
+        st.subheader("📝 点评报告")
         if st.session_state.current_sources:
-            with st.expander("📂 匹配到的参考文件 (已开启硬核校验)", expanded=True):
-                for s in st.session_state.current_sources:
-                    st.write(f"✅ 系统已找到：`:blue[{s}]`")
-        elif st.session_state.report_content:
-            st.error("❌ 未在知识库中找到该药名的匹配文件！")
+            st.info(f"参考文件: {', '.join(st.session_state.current_sources)}")
         
         if st.session_state.report_content:
-            st.session_state.report_content = st.text_area(
-                "手动修正区：",
-                value=st.session_state.report_content,
-                height=500,
-                key="editor"
-            )
-
-            if st.button("✅ 确认修改内容"):
-                st.session_state.is_confirmed = True
-                st.success("同步成功")
-
-            st.divider()
-            if st.session_state.is_confirmed:
-                docx_data = generate_docx(st.session_state.report_content)
-                st.download_button("📥 导出 Word 报告", data=docx_data, file_name="点评报告.docx")
+            report = st.text_area("内容:", value=st.session_state.report_content, height=500)
+            if st.download_button("📥 导出 Word", data=generate_docx(report), file_name="报告.docx"):
+                st.success("导出成功")
 
 if __name__ == "__main__":
     main()
