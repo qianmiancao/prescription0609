@@ -134,7 +134,7 @@ def main():
                     km.upload_docs(tmp.name, f.name) 
             st.success("同步完成")
 
-    st.title("🏥 临床药师点评专家平台 (纯净文本版)")
+    st.title("🏥 临床药师点评专家平台")
 
     col_in, col_out = st.columns([1, 1.3])
 
