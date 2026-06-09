@@ -10,3 +10,4 @@ pysqlite3-binary
 torch
 # 核心修复：锁定 protobuf 版本以解决版本冲突
 protobuf==3.20.3
+python-docx
